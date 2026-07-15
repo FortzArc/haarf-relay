@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./... ./testdata/gen
+      - name: test
+        run: go test -race ./...
+
+  # Test-data policy: fixtures must be regenerable from the pinned HAARF
+  # checkout with zero diff. Bump HAARF_PIN deliberately; if regeneration
+  # diverges, upstream changed its audit format and the parser needs review.
+  fixtures-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HAARF_PIN: main # TODO: pin to a commit SHA once fixtures stabilize
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: clone pinned HAARF
+        run: git clone --depth 1 --branch "$HAARF_PIN" https://github.com/Task-force-for-AI-agents-in-Healthcare/haarf ../haarf
+      - name: regenerate fixtures
+        run: make fixtures
+      - name: fixtures are unmodified
+        run: git diff --exit-code -- testdata/
