@@ -1,6 +1,6 @@
-// Package pipeline wires input lines through parse → (redact → enrich, M2/M3)
-// → emit, and owns per-run bookkeeping: event IDs, provenance stamping, and
-// counters.
+// Package pipeline wires input lines through parse → redact → (enrich, M3)
+// → emit, and owns per-run bookkeeping: event IDs, provenance stamping,
+// quarantine routing, and counters.
 package pipeline
 
 import (
@@ -11,7 +11,14 @@ import (
 
 	"github.com/FortzArc/haarf-relay/internal/emit"
 	"github.com/FortzArc/haarf-relay/internal/parse"
+	"github.com/FortzArc/haarf-relay/internal/redact"
 )
+
+// Quarantiner spools an unforwardable line. Implemented by
+// quarantine.Writer; kept as a local interface so tests can capture.
+type Quarantiner interface {
+	Write(reason string, line []byte) error
+}
 
 // Options configures a pipeline run.
 type Options struct {
@@ -22,15 +29,28 @@ type Options struct {
 	// hc_agent.relay.* provenance fields.
 	RelayVersion  string
 	SchemaVersion string
+	// Redactor applies the allowlist policy. Required: a pipeline without
+	// redaction must be impossible to construct by accident.
+	Redactor *redact.Redactor
+	// Quarantine receives lines that failed parsing or redaction. When nil
+	// the line is counted as dropped instead — never emitted, never spooled
+	// in plaintext.
+	Quarantine Quarantiner
 }
 
 // Stats counts a run's outcomes. An unparsed line is one no parser claimed;
-// a parse error is a claimed line the parser rejected (quarantine, from M2).
+// parse errors and redact errors are quarantined (or dropped when no
+// quarantine is configured — QuarantineDropped).
 type Stats struct {
-	Parsed      map[string]int // by parser name
-	Unparsed    int
-	ParseErrors int
-	Emitted     int
+	Parsed            map[string]int // by parser name
+	Unparsed          int
+	ParseErrors       int
+	RedactErrors      int
+	Quarantined       int
+	QuarantineDropped int
+	FieldsDropped     int            // residual keys removed by the allowlist
+	Redactions        map[string]int // by scrubber name
+	Emitted           int
 }
 
 type Pipeline struct {
@@ -46,17 +66,25 @@ func New(reg *parse.Registry, out emit.Emitter, opts Options) *Pipeline {
 			return ulid.MustNew(ulid.Now(), rand.Reader).String()
 		}
 	}
+	if opts.Redactor == nil {
+		opts.Redactor = redact.NewRedactor(redact.DefaultPolicy())
+	}
 	return &Pipeline{
-		reg:   reg,
-		out:   out,
-		opts:  opts,
-		stats: Stats{Parsed: make(map[string]int)},
+		reg:  reg,
+		out:  out,
+		opts: opts,
+		stats: Stats{
+			Parsed:     make(map[string]int),
+			Redactions: make(map[string]int),
+		},
 	}
 }
 
-// Process runs one line through the pipeline. Unparsed lines and parse
-// errors are counted, not fatal; only emit failures propagate, because a
-// destination that cannot accept events must back-pressure the input.
+// Process runs one line through the pipeline. Unparsed lines are counted;
+// parse and redact failures quarantine the line (fail-closed). Only emit and
+// quarantine-write failures propagate: a destination that cannot accept
+// events must back-pressure the input, and a quarantine that cannot spool
+// must stop the pipeline rather than leak or lose the event.
 func (p *Pipeline) Process(line []byte) error {
 	parser := p.reg.Match(line)
 	if parser == nil {
@@ -66,9 +94,19 @@ func (p *Pipeline) Process(line []byte) error {
 	ev, err := parser.Parse(line)
 	if err != nil {
 		p.stats.ParseErrors++
-		return nil
+		return p.quarantine("parse_error: "+err.Error(), line)
 	}
 	p.stats.Parsed[parser.Name()]++
+
+	res, err := p.opts.Redactor.Redact(ev)
+	for name, n := range res.Redactions {
+		p.stats.Redactions[name] += n
+	}
+	p.stats.FieldsDropped += res.Dropped
+	if err != nil {
+		p.stats.RedactErrors++
+		return p.quarantine("redact_error: "+err.Error(), line)
+	}
 
 	if ev.EventID == "" {
 		ev.EventID = p.opts.IDFunc()
@@ -80,6 +118,18 @@ func (p *Pipeline) Process(line []byte) error {
 		return fmt.Errorf("emit: %w", err)
 	}
 	p.stats.Emitted++
+	return nil
+}
+
+func (p *Pipeline) quarantine(reason string, line []byte) error {
+	if p.opts.Quarantine == nil {
+		p.stats.QuarantineDropped++
+		return nil
+	}
+	if err := p.opts.Quarantine.Write(reason, line); err != nil {
+		return fmt.Errorf("quarantine: %w", err)
+	}
+	p.stats.Quarantined++
 	return nil
 }
 

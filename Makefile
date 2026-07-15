@@ -10,12 +10,13 @@ test:
 
 lint:
 	test -z "$$(gofmt -l .)"
-	go vet ./... ./testdata/gen
+	go vet ./... ./testdata/gen ./testdata/gen/canary
 
 # Regenerate fixtures from a HAARF checkout (test-data policy: fixtures are
 # generated, never hand-edited).
 fixtures:
 	go run ./testdata/gen -haarf $(HAARF_DIR) -scenario RT-1 -out testdata/haarf_audit/rt1.jsonl
+	go run ./testdata/gen/canary -out internal/conformance/corpus
 
 # Regenerate golden outputs after an intentional wire-format change.
 golden:

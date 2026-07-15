@@ -17,9 +17,15 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)"
       - name: vet
-        run: go vet ./... ./testdata/gen
+        run: go vet ./... ./testdata/gen ./testdata/gen/canary
       - name: test
         run: go test -race ./...
+      - name: fuzz (short)
+        run: go test -fuzz=FuzzScrubbers -fuzztime=15s ./internal/redact
+      - name: conformance phi against the built binary
+        run: |
+          go build -o haarf-relay ./cmd/haarf-relay
+          ./haarf-relay conformance phi
 
   # Test-data policy: fixtures must be regenerable from the pinned HAARF
   # checkout with zero diff. Bump HAARF_PIN deliberately; if regeneration
@@ -39,4 +45,4 @@ jobs:
       - name: regenerate fixtures
         run: make fixtures
       - name: fixtures are unmodified
-        run: git diff --exit-code -- testdata/
+        run: git diff --exit-code -- testdata/ internal/conformance/corpus/

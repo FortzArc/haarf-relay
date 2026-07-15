@@ -11,20 +11,25 @@ import (
 	"github.com/FortzArc/haarf-relay/internal/event"
 )
 
-// haarfAuditEntry mirrors one entry of the audit_log array produced by the
-// HAARF harness middleware (haarf/audit/schema.json). The schema allows
-// additional properties; we deliberately decode only what we consume.
-type haarfAuditEntry struct {
-	Timestamp    *float64 `json:"timestamp"` // unix seconds, fractional
-	ScenarioID   string   `json:"scenario_id"`
-	Condition    string   `json:"condition"`
-	PatientID    string   `json:"patient_id"`
-	ToolName     string   `json:"tool_name"`
-	ToolArgsHash string   `json:"tool_args_hash"`
-	Decision     string   `json:"decision"`
-	DenialReason *string  `json:"denial_reason"`
-	TrialID      string   `json:"trial_id"`
-	ModelName    string   `json:"model_name"`
+// requiredFields per haarf/audit/schema.json, in schema order.
+var requiredFields = []string{
+	"trial_id", "scenario_id", "condition", "timestamp", "patient_id",
+	"tool_name", "tool_args_hash", "decision", "model_name",
+}
+
+// consumedFields are mapped into CanonicalEvent struct fields (or
+// deliberately suppressed) and therefore excluded from residual passthrough:
+//   - patient_id is pseudonymized into hc_agent.patient.context_hash
+//   - denial_reason is reduced to hc_agent.policy.layer; its free text is
+//     clinical content and is not forwarded by this parser
+//
+// Everything else (tool_args included) rides through as an
+// hc_agent.haarf.<key> residual for the redact stage's allowlist to judge —
+// dropping unknown fields is redaction policy, not parser behavior.
+var consumedFields = map[string]struct{}{
+	"timestamp": {}, "scenario_id": {}, "condition": {}, "patient_id": {},
+	"tool_name": {}, "tool_args_hash": {}, "decision": {},
+	"denial_reason": {}, "trial_id": {}, "model_name": {},
 }
 
 // layerPrefixes maps the denial_reason prefix written by
@@ -70,65 +75,96 @@ func (p *HAARFAudit) Sniff(line []byte) bool {
 }
 
 func (p *HAARFAudit) Parse(line []byte) (*event.CanonicalEvent, error) {
-	var in haarfAuditEntry
-	if err := json.Unmarshal(line, &in); err != nil {
+	var m map[string]any
+	if err := json.Unmarshal(line, &m); err != nil {
 		return nil, fmt.Errorf("haarf_audit: invalid JSON: %w", err)
 	}
-	if err := in.validate(); err != nil {
+	if err := validateRequired(m); err != nil {
 		return nil, fmt.Errorf("haarf_audit: %w", err)
 	}
 
-	sec, frac := math.Modf(*in.Timestamp)
+	str := func(key string) (string, error) {
+		s, ok := m[key].(string)
+		if !ok {
+			return "", fmt.Errorf("haarf_audit: field %q: expected string, got %T", key, m[key])
+		}
+		return s, nil
+	}
+	var fields struct {
+		scenarioID, condition, patientID, toolName,
+		toolArgsHash, decision, trialID, modelName string
+	}
+	for _, f := range []struct {
+		key string
+		dst *string
+	}{
+		{"scenario_id", &fields.scenarioID},
+		{"condition", &fields.condition},
+		{"patient_id", &fields.patientID},
+		{"tool_name", &fields.toolName},
+		{"tool_args_hash", &fields.toolArgsHash},
+		{"decision", &fields.decision},
+		{"trial_id", &fields.trialID},
+		{"model_name", &fields.modelName},
+	} {
+		s, err := str(f.key)
+		if err != nil {
+			return nil, err
+		}
+		*f.dst = s
+	}
+	ts, ok := m["timestamp"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("haarf_audit: field \"timestamp\": expected number, got %T", m["timestamp"])
+	}
+	if fields.decision != "allow" && fields.decision != "deny" {
+		return nil, fmt.Errorf("haarf_audit: invalid decision %q", fields.decision)
+	}
+	var denialReason *string
+	switch v := m["denial_reason"].(type) {
+	case string:
+		denialReason = &v
+	case nil:
+	default:
+		return nil, fmt.Errorf("haarf_audit: field \"denial_reason\": expected string or null, got %T", v)
+	}
+
+	sec, frac := math.Modf(ts)
 	ev := &event.CanonicalEvent{
 		Timestamp:      time.Unix(int64(sec), int64(frac*1e9)).UTC(),
 		Operation:      "execute_tool",
-		Model:          in.ModelName,
-		ToolName:       in.ToolName,
-		PolicyDecision: in.Decision,
-		PolicyLayer:    deriveLayer(in.Decision, in.DenialReason),
+		Model:          fields.modelName,
+		ToolName:       fields.toolName,
+		PolicyDecision: fields.decision,
+		PolicyLayer:    deriveLayer(fields.decision, denialReason),
 		SourceFormat:   p.Name(),
 		Raw: map[string]any{
-			"hc_agent.haarf.trial_id":    in.TrialID,
-			"hc_agent.haarf.scenario_id": in.ScenarioID,
-			"hc_agent.haarf.condition":   in.Condition,
-			"hc_agent.tool.args_hash":    in.ToolArgsHash,
+			"hc_agent.haarf.trial_id":    fields.trialID,
+			"hc_agent.haarf.scenario_id": fields.scenarioID,
+			"hc_agent.haarf.condition":   fields.condition,
+			"hc_agent.tool.args_hash":    fields.toolArgsHash,
 		},
 	}
-	// patient_id is a raw (synthetic) MRN and tool_args / denial_reason may
-	// carry clinical free text. Until the redact stage ships (M2), none of
-	// them pass through: patient_id is pseudonymized or dropped, the rest
-	// is dropped. The derived layer preserves the denial class as evidence.
 	if p.hashPatient != nil {
-		ev.PatientCtxHash = p.hashPatient(in.PatientID)
+		ev.PatientCtxHash = p.hashPatient(fields.patientID)
+	}
+	for k, v := range m {
+		if _, ok := consumedFields[k]; !ok {
+			ev.Raw["hc_agent.haarf."+k] = v
+		}
 	}
 	return ev, nil
 }
 
-func (in *haarfAuditEntry) validate() error {
+func validateRequired(m map[string]any) error {
 	var missing []string
-	for _, f := range []struct {
-		name string
-		ok   bool
-	}{
-		{"trial_id", in.TrialID != ""},
-		{"scenario_id", in.ScenarioID != ""},
-		{"condition", in.Condition != ""},
-		{"timestamp", in.Timestamp != nil},
-		{"patient_id", in.PatientID != ""},
-		{"tool_name", in.ToolName != ""},
-		{"tool_args_hash", in.ToolArgsHash != ""},
-		{"decision", in.Decision != ""},
-		{"model_name", in.ModelName != ""},
-	} {
-		if !f.ok {
-			missing = append(missing, f.name)
+	for _, f := range requiredFields {
+		if v, ok := m[f]; !ok || v == nil || v == "" {
+			missing = append(missing, f)
 		}
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required fields: %s", strings.Join(missing, ", "))
-	}
-	if in.Decision != "allow" && in.Decision != "deny" {
-		return fmt.Errorf("invalid decision %q", in.Decision)
 	}
 	return nil
 }

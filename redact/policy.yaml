@@ -1,0 +1,42 @@
+# haarf-relay redaction policy (allowlist-first).
+#
+# Unknown keys are DROPPED, not scrubbed: in a PHI context the burden of
+# proof is on the field to be safe. Scrubbers run over the string VALUES of
+# allowed keys. Structured (nested) values under an allowed key cannot be
+# deterministically scrubbed and quarantine the whole event (fail-closed).
+#
+# Note: this policy deliberately does NOT allow hc_agent.haarf.* as a
+# wildcard — HAARF audit entries carry tool_args (raw tool arguments) and
+# denial_reason (clinical free text) as source fields, and those must never
+# ride through on a wildcard. Allowed source residuals are enumerated.
+version: 1
+mode: allowlist
+allow:
+  - event.id
+  - event.timestamp
+  - trace_id
+  - span_id
+  - gen_ai.operation.name
+  - gen_ai.request.model
+  - gen_ai.provider.name
+  - gen_ai.usage.*
+  - gen_ai.tool.name
+  - hc_agent.policy.*
+  - hc_agent.haarf.trial_id
+  - hc_agent.haarf.scenario_id
+  - hc_agent.haarf.condition
+  - hc_agent.haarf.requirement_ids
+  - hc_agent.autonomy.level
+  - hc_agent.oversight.mode
+  - hc_agent.patient.context_hash
+  - hc_agent.phi.redaction_count
+  - hc_agent.relay.*
+  - hc_agent.tool.args_hash
+scrubbers:
+  - email
+  - ssn
+  - mrn
+  - dob
+  - us_phone
+  - person_name
+on_error: quarantine

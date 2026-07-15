@@ -74,6 +74,21 @@ func TestHAARFAuditParse(t *testing.T) {
 			wantErr: `invalid decision "block"`,
 		},
 		{
+			name:    "wrong type: condition as array",
+			line:    strings.Replace(validAllow, `"condition":"baseline"`, `"condition":["baseline"]`, 1),
+			wantErr: `field "condition": expected string`,
+		},
+		{
+			name:    "wrong type: timestamp as string",
+			line:    strings.Replace(validAllow, `"timestamp":1772147146.7183628`, `"timestamp":"yesterday"`, 1),
+			wantErr: `field "timestamp": expected number`,
+		},
+		{
+			name:    "wrong type: denial_reason as object",
+			line:    strings.Replace(validAllow, `"denial_reason":null`, `"denial_reason":{"code":1}`, 1),
+			wantErr: `field "denial_reason": expected string or null`,
+		},
+		{
 			name:    "malformed JSON",
 			line:    validAllow[:len(validAllow)/2],
 			wantErr: "invalid JSON",
@@ -157,7 +172,7 @@ func TestHAARFAuditPatientHandling(t *testing.T) {
 	if ev.PatientCtxHash != "" {
 		t.Errorf("PatientCtxHash = %q, want empty without hasher", ev.PatientCtxHash)
 	}
-	assertNoRawPHI(t, ev.Raw)
+	assertPatientSuppressed(t, ev.Raw)
 
 	// With a hasher the reference is pseudonymized, never raw.
 	hasher := func(ref string) string { return "hashed:" + ref + ":hashed" }
@@ -168,24 +183,34 @@ func TestHAARFAuditPatientHandling(t *testing.T) {
 	if ev.PatientCtxHash != "hashed:SYN-001:hashed" {
 		t.Errorf("PatientCtxHash = %q, want hasher output", ev.PatientCtxHash)
 	}
-	assertNoRawPHI(t, ev.Raw)
+	assertPatientSuppressed(t, ev.Raw)
 }
 
-// assertNoRawPHI checks that neither the raw patient id, tool args content,
-// nor denial free text leaked into the residual fields.
-func assertNoRawPHI(t *testing.T, raw map[string]any) {
+// assertPatientSuppressed checks that patient_id and denial_reason never
+// ride through as residuals — they are the two consumed-and-suppressed
+// fields; everything else (tool_args included) is the redact stage's job.
+func assertPatientSuppressed(t *testing.T, raw map[string]any) {
 	t.Helper()
-	for k, v := range raw {
-		s, ok := v.(string)
-		if !ok {
-			t.Errorf("Raw[%q] is %T; only scalar strings expected in M1", k, v)
-			continue
+	for _, k := range []string{"hc_agent.haarf.patient_id", "hc_agent.haarf.denial_reason"} {
+		if v, ok := raw[k]; ok {
+			t.Errorf("suppressed field passed through: Raw[%q] = %v", k, v)
 		}
-		if k != "hc_agent.haarf.trial_id" && strings.Contains(s, "SYN-001") {
-			t.Errorf("raw patient id leaked into Raw[%q] = %q", k, s)
-		}
-		if strings.Contains(s, "Chest CT") {
-			t.Errorf("tool args leaked into Raw[%q] = %q", k, s)
-		}
+	}
+}
+
+func TestHAARFAuditResidualPassthrough(t *testing.T) {
+	// Unknown source fields must reach Raw as hc_agent.haarf.* residuals —
+	// dropping them is the redact stage's allowlist decision, not the
+	// parser's.
+	line := strings.Replace(validAllow, `"tool_args":{`, `"custom_note":"hello","tool_args":{`, 1)
+	ev, err := NewHAARFAudit(nil).Parse([]byte(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ev.Raw["hc_agent.haarf.custom_note"]; !ok || got != "hello" {
+		t.Errorf("Raw[hc_agent.haarf.custom_note] = %v (present=%v), want \"hello\"", got, ok)
+	}
+	if _, ok := ev.Raw["hc_agent.haarf.tool_args"]; !ok {
+		t.Error("tool_args residual missing — the redact allowlist, not the parser, must drop it")
 	}
 }
