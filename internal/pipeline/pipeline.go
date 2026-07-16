@@ -1,5 +1,5 @@
-// Package pipeline wires input lines through parse → redact → (enrich, M3)
-// → emit, and owns per-run bookkeeping: event IDs, provenance stamping,
+// Package pipeline wires input lines through parse → redact → enrich →
+// emit, and owns per-run bookkeeping: event IDs, provenance stamping,
 // quarantine routing, and counters.
 package pipeline
 
@@ -10,6 +10,8 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/FortzArc/haarf-relay/internal/emit"
+	"github.com/FortzArc/haarf-relay/internal/enrich"
+	"github.com/FortzArc/haarf-relay/internal/metrics"
 	"github.com/FortzArc/haarf-relay/internal/parse"
 	"github.com/FortzArc/haarf-relay/internal/redact"
 )
@@ -36,6 +38,11 @@ type Options struct {
 	// the line is counted as dropped instead — never emitted, never spooled
 	// in plaintext.
 	Quarantine Quarantiner
+	// Enricher attaches HAARF requirement IDs and evaluates watch rules.
+	// Optional: a nil enricher emits events with empty requirement IDs.
+	Enricher *enrich.Enricher
+	// Metrics receives safety and health counters. Optional.
+	Metrics *metrics.Registry
 }
 
 // Stats counts a run's outcomes. An unparsed line is one no parser claimed;
@@ -50,6 +57,7 @@ type Stats struct {
 	QuarantineDropped int
 	FieldsDropped     int            // residual keys removed by the allowlist
 	Redactions        map[string]int // by scrubber name
+	EnrichMiss        int            // events no mapping rule matched
 	Emitted           int
 }
 
@@ -94,6 +102,10 @@ func (p *Pipeline) Process(line []byte) error {
 	ev, err := parser.Parse(line)
 	if err != nil {
 		p.stats.ParseErrors++
+		if m := p.opts.Metrics; m != nil {
+			m.ParseIncomplete()
+			m.Quarantined("parse_error")
+		}
 		return p.quarantine("parse_error: "+err.Error(), line)
 	}
 	p.stats.Parsed[parser.Name()]++
@@ -105,7 +117,23 @@ func (p *Pipeline) Process(line []byte) error {
 	p.stats.FieldsDropped += res.Dropped
 	if err != nil {
 		p.stats.RedactErrors++
+		if m := p.opts.Metrics; m != nil {
+			m.Quarantined("redact_error")
+		}
 		return p.quarantine("redact_error: "+err.Error(), line)
+	}
+
+	if p.opts.Enricher != nil {
+		eres := p.opts.Enricher.Enrich(ev)
+		if eres.Miss {
+			p.stats.EnrichMiss++
+			if m := p.opts.Metrics; m != nil {
+				m.EnrichMiss()
+			}
+		}
+		if m := p.opts.Metrics; m != nil {
+			m.Watch(eres.Watch)
+		}
 	}
 
 	if ev.EventID == "" {
@@ -118,6 +146,9 @@ func (p *Pipeline) Process(line []byte) error {
 		return fmt.Errorf("emit: %w", err)
 	}
 	p.stats.Emitted++
+	if m := p.opts.Metrics; m != nil {
+		m.EventEmitted(ev.SourceFormat, ev.PolicyDecision, ev.PolicyLayer, ev.Raw)
+	}
 	return nil
 }
 

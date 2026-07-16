@@ -11,10 +11,13 @@ stack: [HAARF](https://github.com/Task-force-for-AI-agents-in-Healthcare/haarf) 
 rules, [QFIRE](https://github.com/Task-force-for-AI-agents-in-Healthcare/qfire) enforces them at
 runtime, and haarf-relay proves — continuously, from production logs — that they were followed.
 
-**Status: M2 (redaction).** Working today: `stdin → parse(haarf_audit) → redact → stdout`
-JSONL with the flat dotted-key wire format (`gen_ai.*` / `hc_agent.*`), allowlist-first PHI
-redaction with deterministic scrubbers, an age-encrypted fail-closed quarantine spool, and the
-`conformance phi` self-test. Next: enrichment + metrics (M3), Splunk/OTLP outputs (M4).
+**Status: M3 (enrichment + metrics).** Working today: `stdin → parse(haarf_audit) → redact →
+enrich → stdout` JSONL with the flat dotted-key wire format (`gen_ai.*` / `hc_agent.*`),
+allowlist-first PHI redaction with deterministic scrubbers, an age-encrypted fail-closed
+quarantine spool, data-driven HAARF requirement tagging (`mappings/haarf_map.json`), live
+safety metrics on a Prometheus `/metrics` endpoint, the `conformance phi` self-test, and an
+agentic observability conformance suite that replays real-model agent trials end to end.
+Next: Splunk/OTLP outputs + queues (M4).
 
 ## Try it
 
@@ -22,7 +25,8 @@ redaction with deterministic scrubbers, an age-encrypted fail-closed quarantine 
 go build ./cmd/haarf-relay
 export HAARF_RELAY_SALT=$(openssl rand -hex 16)   # per-deployment patient-hash salt
 export HAARF_RELAY_QUARANTINE_RECIPIENT=age1...   # age-keygen public key; private key stays with you
-./haarf-relay -quarantine-dir /var/lib/haarf-relay/quarantine < testdata/haarf_audit/rt1.jsonl
+./haarf-relay -quarantine-dir /var/lib/haarf-relay/quarantine \
+  -metrics-listen :9464 < testdata/haarf_audit/rt1.jsonl
 
 # prove zero PHI leakage on your build/policy (FR-8):
 ./haarf-relay conformance phi
@@ -52,6 +56,38 @@ How PHI is handled (deterministic by design — an audit property; no ML in v0.x
 - **`haarf-relay conformance phi`** replays a synthetic-PHI-seeded corpus through the full
   pipeline and byte-scans everything downstream (output and quarantine ciphertext) for every
   canary value; it exits non-zero on any leak. The same engine runs in CI on every push.
+
+## Enrichment and safety metrics (M3)
+
+Every event is tagged with the HAARF requirement IDs it evidences, driven by
+`mappings/haarf_map.json` — data, not code; when HAARF publishes a new revision you update a
+JSON file, not the binary. A denied RBAC tool call carries `["C8.1.1","C8.1.2","C8.4.1",...]`;
+every event carries the audit-control requirements `C8.1.5`/`C8.4.3`. Events no rule matches
+are emitted with empty IDs and counted (`haarf_enrich_miss_total`) — a visible gap, never a
+silent one. The same mapping file's `watch` rules define the safety counters, so
+deployment-specific policy knowledge (which tools are unauthorized where) also lives in data.
+
+`-metrics-listen :9464` serves Prometheus metrics: `haarf_utsr_total` (unauthorized
+executions — any nonzero value is a page), `haarf_uta_total` (blocked attempts, the leading
+indicator), `haarf_cmr_total`, `haarf_pisr_total`, `haarf_events_total{format,decision,layer}`,
+`haarf_phi_redactions_total{scrubber}`, `haarf_enrich_miss_total`, `haarf_tc_ratio` (audit
+completeness), `haarf_trials_observed{scenario,condition}`, `relay_quarantine_total{reason}`,
+and `relay_build_info` (the exact version/schema/mapping that produced the evidence).
+`-metrics-dump file` writes the final exposition at exit for batch runs.
+
+## Agentic observability conformance
+
+`make agentic` replays the audit stream of a **real model run** (claude-haiku-4-5 driven
+through the HAARF red-team harness; committed under `testdata/agentic/`) through the real
+relay binary — subprocess, stdin, live `/metrics` scrape — and asserts the standard end to
+end: requirement tagging per policy layer, zero PHI from real agent logs downstream, the
+paper's headline finding reproduced from logs alone (baseline `UTSR>0`; under HAARF middleware
+`UTSR==0` with `UTA>0`), every evidence-bearing trial observed, and trials that produced
+*zero* audit events (e.g. the model refusing before any tool call) surfaced as named
+evidence gaps rather than silent passes. Verdicts are cross-checked per trial against the
+harness's own pass/fail record. `make agentic-live` runs the harness against a live model
+first (`ANTHROPIC_API_KEY` + a HAARF checkout with a `.venv`); `HAARF_TRIALS_DIR` points the
+suite at any directory of harness trial files.
 
 ## Develop
 

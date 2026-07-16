@@ -17,7 +17,7 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)"
       - name: vet
-        run: go vet ./... ./testdata/gen ./testdata/gen/canary
+        run: go vet ./... ./testdata/gen ./testdata/gen/canary ./testdata/gen/agentic
       - name: test
         run: go test -race ./...
       - name: fuzz (short)
